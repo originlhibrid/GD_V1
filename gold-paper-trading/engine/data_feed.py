@@ -1,16 +1,53 @@
-"""yfinance data fetching — one feed per timeframe."""
+"""yfinance data fetching — no Backtrader dependency."""
+
+from __future__ import annotations
 
 import pandas as pd
 import yfinance as yf
-import backtrader as bt
 
 from .config import TICKER, TIMEFRAMES
 
 
+def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize a yfinance DataFrame to lowercase columns [open, high, low, close, volume].
+    Handles both MultiIndex columns and single-level column names,
+    and auto_adjust=True (which omits Adjusted Close).
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
+
+    # Normalize column names to Title case
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    df.columns = [str(c).Title() if hasattr(str(c), 'Title') else str(c).capitalize()
+                  for c in df.columns]
+
+    # Map Title case to lowercase
+    rename = {
+        "Open": "open", "High": "high", "Low": "low",
+        "Close": "close", "Volume": "volume",
+    }
+    df = df.rename(columns=rename)
+
+    # Keep only OHLCV columns that exist
+    cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+    df = df[cols]
+
+    # Drop rows missing close
+    df = df.dropna(subset=["close"])
+
+    return df
+
+
 def fetch_yfinance(tf_key: str) -> pd.DataFrame:
     """
-    Fetch OHLCV data from yfinance for the given timeframe key.
-    Returns a clean DataFrame with lowercase columns.
+    Fetch full OHLCV history from yfinance for the given timeframe key.
+    Used for initial historical seeding of the buffer.
     """
     cfg = TIMEFRAMES[tf_key]
     interval = cfg["interval"]
@@ -20,44 +57,20 @@ def fetch_yfinance(tf_key: str) -> pd.DataFrame:
     start_str = start.strftime("%Y-%m-%d")
 
     df = yf.download(
-        TICKER, start=start_str, end=None,
-        interval=interval, auto_adjust=True, progress=False
+        TICKER,
+        start=start_str,
+        end=None,
+        interval=interval,
+        auto_adjust=True,
+        progress=False,
     )
-    df = df.dropna()
-    df.index = pd.to_datetime(df.index)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    # Rename to lowercase expected by Backtrader
-    rename = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
-    df = df.rename(columns=rename)
-    # Ensure correct column order
-    df = df[["open", "high", "low", "close", "volume"]]
-    return df
+    return _normalize_yf_df(df)
 
 
-class YFinanceData(bt.feeds.PandasData):
-    """Backtrader PandasData feed wrapping a yfinance DataFrame."""
-    params = (
-        ("datetime", None),
-        ("open", "open"),
-        ("high", "high"),
-        ("low", "low"),
-        ("close", "close"),
-        ("volume", "volume"),
-        ("openinterest", -1),
-    )
-
-
-def build_feed(tf_key: str) -> YFinanceData:
-    """Fetch historical data and return a Backtrader feed for the timeframe."""
-    df = fetch_yfinance(tf_key)
-    return YFinanceData(dataname=df)
-
-
-def fetch_latest_df(tf_key: str) -> pd.DataFrame:
+def fetch_latest(tf_key: str) -> pd.DataFrame:
     """
-    Fetch the latest window of data for incremental bar updates.
-    The caller is responsible for diffing against what it already has.
+    Fetch the most recent window of data from yfinance for incremental updates.
+    Caller diffs against its last known timestamp to avoid duplicates.
     """
     cfg = TIMEFRAMES[tf_key]
     interval = cfg["interval"]
@@ -65,42 +78,40 @@ def fetch_latest_df(tf_key: str) -> pd.DataFrame:
 
     start = pd.Timestamp.utcnow() - pd.Timedelta(days=days + 1)
     df = yf.download(
-        TICKER, start=start.strftime("%Y-%m-%d"), end=None,
-        interval=interval, auto_adjust=True, progress=False
+        TICKER,
+        start=start.strftime("%Y-%m-%d"),
+        end=None,
+        interval=interval,
+        auto_adjust=True,
+        progress=False,
     )
-    df = df.dropna()
-    df.index = pd.to_datetime(df.index)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    # Rename to lowercase expected by Backtrader
-    rename = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
-    df = df.rename(columns=rename)
-    # Ensure correct column order
-    df = df[["open", "high", "low", "close", "volume"]]
-    return df
+    return _normalize_yf_df(df)
 
 
-def append_new_bars(data_feed, df_new):
+def iter_new_candles(
+    df_new: pd.DataFrame,
+    last_ts: pd.Timestamp | None,
+) -> list[tuple[str, float, float, float, float, float]]:
     """
-    Append closed bars from df_new that are not yet in data_feed.
-    Tracks already-loaded bar count via data_feed._bar_count.
+    Yield only rows from df_new that are strictly after last_ts.
+    Returns list of (timestamp_str, open, high, low, close, volume).
     """
-    existing = getattr(data_feed, "_bar_count", 0)
-    if existing == 0:
-        existing = len(df_new)
+    if df_new.empty:
+        return []
 
-    new_rows = df_new.iloc[existing:]
-    if new_rows.empty:
-        return 0
+    if last_ts is None:
+        rows = df_new
+    else:
+        rows = df_new[df_new.index > last_ts]
 
-    for _, row in new_rows.iterrows():
-        bar_time = row.name.to_pydatetime()
-        bar_dt = bt.date2num(bar_time)
-        o, h, l, c, v = (
-            float(row.open), float(row.high),
-            float(row.low), float(row.close), float(row.volume)
-        )
-        data_feed._insert((bar_dt, o, h, l, c, v, -1))
-
-    data_feed._bar_count = existing + len(new_rows)
-    return len(new_rows)
+    result = []
+    for ts, row in rows.iterrows():
+        result.append((
+            ts.to_pydatetime().strftime("%Y-%m-%d %H:%M:%S"),
+            float(row.open),
+            float(row.high),
+            float(row.low),
+            float(row.close),
+            float(row.volume),
+        ))
+    return result

@@ -1,8 +1,8 @@
-backtrader
 yfinance>=0.2.0
 pandas
 numpy
+numba
 apscheduler
 fastapi
 uvicorn[standard]
-sqlalchemy  # for db helpers if needed
+sqlalchemy
