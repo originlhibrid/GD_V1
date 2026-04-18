@@ -1,6 +1,6 @@
 """
 Bar-by-bar live trading using your exact _execute entry/exit logic.
-No Backtrader dependency.
+
 
 Maintains a rolling buffer of up to MAX_BUFFER bars.
 On each new candle: recomputes indicators, runs entry/exit bar-by-bar.

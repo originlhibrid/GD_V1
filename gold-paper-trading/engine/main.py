@@ -4,7 +4,7 @@ Gold Paper Trading Engine — 3 independent pure-Python instances.
 Each timeframe (5M / 15M / 1H) runs in its own PROCESS with:
   - its own PaperBroker ($10,000 starting capital)
   - its own SQLite DB (trading_5m.db / trading_15m.db / trading_1h.db)
-  - its own LiveStrategy (bar-by-bar, no Backtrader)
+  - its own LiveStrategy (bar-by-bar execution)
   - its own APScheduler polling yfinance at the correct cadence
 
 Usage:

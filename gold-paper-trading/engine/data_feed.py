@@ -1,4 +1,4 @@
-"""yfinance data fetching — no Backtrader dependency."""
+"""yfinance data fetching — """
 
 from __future__ import annotations
 

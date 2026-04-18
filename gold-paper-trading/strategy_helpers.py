@@ -1,4 +1,4 @@
-"""Pure numpy/numba indicator helpers — no Backtrader dependency."""
+"""Pure numpy/numba indicator helpers — """
 
 import numpy as np
 from numba import njit

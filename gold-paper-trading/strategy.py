@@ -1,6 +1,6 @@
 """
 Pure Python + Numba momentum_adaptive_v7 strategy.
-No Backtrader dependency. Uses your exact _execute numba loop.
+ Uses your exact _execute numba loop.
 """
 
 import numpy as np

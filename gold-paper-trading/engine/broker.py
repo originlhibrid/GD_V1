@@ -1,5 +1,5 @@
 """
-Pure Python paper broker — full Kelly sizing (no Backtrader dependency).
+Pure Python paper broker — full Kelly sizing .
 Matches buy_all/sell_all from strategy_helpers.py.
 """
 
