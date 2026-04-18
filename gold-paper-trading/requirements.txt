@@ -1,0 +1,8 @@
+backtrader
+yfinance>=0.2.0
+pandas
+numpy
+apscheduler
+fastapi
+uvicorn[standard]
+sqlalchemy  # for db helpers if needed
