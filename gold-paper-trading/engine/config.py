@@ -12,6 +12,13 @@ MOM_DECAY_PERIOD = 5
 WAIT_BUY = 9
 WAIT_SELL = 27
 
+# ── Kronos AI Signal Layer ─────────────────────────────────────────────────────
+USE_KRONOS              = True
+KRONOS_MODEL            = "NeoQuasar/Kronos-base"  # "NeoQuasar/Kronos-mini" | "NeoQuasar/Kronos-small"
+KRONOS_HORIZON          = 5                         # bars ahead to forecast
+KRONOS_BEARISH_THRESHOLD = 0.003                   # 0.3% predicted drop = bearish
+KRONOS_INTERVAL         = 1                         # run Kronos every N bars (1 = every bar)
+
 # Ticker proxy for XAUUSD via yfinance
 TICKER = "GC=F"
 

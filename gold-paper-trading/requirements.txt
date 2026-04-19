@@ -6,3 +6,19 @@ apscheduler
 fastapi
 uvicorn[standard]
 sqlalchemy
+
+# Kronos / ML
+torch>=2.1.0
+transformers>=4.40.0
+huggingface_hub>=0.23.0
+accelerate>=0.30.0
+
+# Backtesting
+backtrader>=1.9.78
+
+# Utilities
+python-dotenv>=1.0.0
+rich>=13.7.0
+schedule>=1.2.0
+plotext>=5.2.8
+pytest>=8.0.0

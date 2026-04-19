@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+import sys
 import threading
 from datetime import datetime
 from typing import Optional
@@ -15,6 +16,9 @@ from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+
+# WSL2 NOTE: set MPLBACKEND before any matplotlib import
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 # ── Project root ────────────────────────────────────────────────────────────────
 
@@ -26,12 +30,16 @@ from engine.config import (
     ROC_FAST_PERIOD, ROC_SLOW_PERIOD, TREND_PERIOD, ATR_PERIOD,
     BASE_TRAILING_ATR_MULT, TRAIL_TIGHTEN_MULT, MOM_STRONG_THRESHOLD,
     MOM_DECAY_PERIOD, WAIT_BUY,
+    USE_KRONOS, KRONOS_MODEL, KRONOS_HORIZON,
+    KRONOS_BEARISH_THRESHOLD, KRONOS_INTERVAL,
 )
 from engine.db import (
     init_db, get_trades, get_equity, get_candles,
     get_latest_indicator, get_portfolio_status, get_all_equity,
-    make_db_path,
+    make_db_path, get_kronos_signals as _get_kronos_signals,
+    get_kronos_stats as _get_kronos_stats,
 )
+from engine.kronos_wrapper import get_kronos, check_cuda_status
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
@@ -104,6 +112,33 @@ class TfState:
 
 # One state object per timeframe
 tf_states = {tf: TfState(tf) for tf in VALID_TF}
+
+# ── Global Kronos runtime toggle ───────────────────────────────────────────────
+
+_kronos_runtime_enabled = True  # can be toggled at runtime via POST
+
+
+def _get_kronos_signal_for_tf(tf: str) -> dict:
+    """Return the latest Kronos signal from the strategy for a given timeframe."""
+    # Strategy instance lives in the engine process (not this API process).
+    # The API reads the latest signal from the timeframe's SQLite DB instead.
+    db = get_db_path(tf)
+    if not os.path.exists(db):
+        return {}
+    try:
+        signals = _get_kronos_signals(db, limit=1)
+        if signals:
+            s = signals[0]
+            return {
+                "direction":        s.get("direction", "neutral"),
+                "confidence":       s.get("confidence", 0.0),
+                "predicted_close":  s.get("pred_close", 0.0),
+                "volatility_high":  bool(s.get("vol_high", 0)),
+                "action":           s.get("action_taken", "none"),
+            }
+    except Exception:
+        pass
+    return {}
 
 
 def refresh_state(tf: str):
@@ -216,7 +251,87 @@ def get_params(timeframe: str = Query(DEFAULT_TF, regex="^(5m|15m|1h)$")):
         "mom_decay_period":       MOM_DECAY_PERIOD,
         "wait_buy":               WAIT_BUY,
         "starting_capital":       STARTING_CAPITAL,
+        "use_kronos":             _kronos_runtime_enabled,
+        "kronos_model":           KRONOS_MODEL,
+        "kronos_horizon":         KRONOS_HORIZON,
     }
+
+
+# ── Kronos AI Endpoints ────────────────────────────────────────────────────────
+
+@app.get("/api/kronos/latest")
+def get_kronos_latest(timeframe: str = Query(DEFAULT_TF, regex="^(5m|15m|1h)$")):
+    """Latest Kronos signal for the selected timeframe."""
+    db = get_db_path(timeframe)
+    ensure_db(timeframe)
+    signals = _get_kronos_signals(db, limit=1)
+    if not signals:
+        return {"direction": "neutral", "confidence": 0.0,
+                "predicted_close": 0.0, "volatility_high": False, "action": "none"}
+    s = signals[0]
+    return {
+        "direction":        s.get("direction", "neutral"),
+        "confidence":       s.get("confidence", 0.0),
+        "predicted_close":  s.get("pred_close", 0.0),
+        "volatility_high":  bool(s.get("vol_high", 0)),
+        "action":           s.get("action_taken", "none"),
+        "timestamp":        s.get("timestamp"),
+    }
+
+
+@app.get("/api/kronos/signals")
+def get_kronos_signals_endpoint(
+    limit: int = Query(100, ge=1, le=500),
+    timeframe: str = Query(DEFAULT_TF, regex="^(5m|15m|1h)$"),
+):
+    """Last N Kronos signal records from DB."""
+    db = get_db_path(timeframe)
+    ensure_db(timeframe)
+    signals = _get_kronos_signals(db, limit=limit)
+    return signals
+
+
+@app.get("/api/kronos/stats")
+def get_kronos_stats_endpoint(
+    timeframe: str = Query(DEFAULT_TF, regex="^(5m|15m|1h)$"),
+):
+    """Override / block / confirm counts for the selected timeframe."""
+    db = get_db_path(timeframe)
+    ensure_db(timeframe)
+    return _get_kronos_stats(db)
+
+
+@app.get("/api/kronos/status")
+def get_kronos_status():
+    """Model loaded state, device, VRAM usage, runtime toggle."""
+    cuda = check_cuda_status()
+    return {
+        "model_loaded":  cuda.get("model_loaded", False),
+        "device":        cuda.get("device"),
+        "gpu_name":      cuda.get("gpu_name"),
+        "vram_gb":       cuda.get("vram_gb"),
+        "cuda_available": cuda.get("cuda_available"),
+        "init_error":    cuda.get("init_error"),
+        "runtime_enabled": _kronos_runtime_enabled,
+        "model_name":    KRONOS_MODEL,
+        "horizon":       KRONOS_HORIZON,
+    }
+
+
+@app.post("/api/kronos/toggle")
+async def post_kronos_toggle(body: dict):
+    """Enable or disable Kronos at runtime."""
+    global _kronos_runtime_enabled
+    enabled = bool(body.get("enabled", True))
+    _kronos_runtime_enabled = enabled
+    # Propagate to KronosWrapper singleton if loaded
+    try:
+        k = get_kronos()
+        if k is not None:
+            k.enabled = enabled
+    except Exception:
+        pass
+    return {"enabled": enabled, "status": "ok"}
 
 
 # ── WebSocket ───────────────────────────────────────────────────────────────────
@@ -243,6 +358,8 @@ class WsManager:
         st = tf_states[tf]
         with st.lock:
             payload = st.to_dict()
+        # Append latest Kronos signal to the WS payload
+        payload["kronos"] = _get_kronos_signal_for_tf(tf)
         msg = {"type": "tick", "data": payload}
         dead = []
         with self.lock:

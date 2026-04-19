@@ -1,17 +1,26 @@
 """
 Bar-by-bar live trading using your exact _execute entry/exit logic.
 
-
 Maintains a rolling buffer of up to MAX_BUFFER bars.
 On each new candle: recomputes indicators, runs entry/exit bar-by-bar.
+
+Kronos AI signal layer (optional):
+  IF Kronos bearish + strategy exit signal   → EXIT immediately (accelerate)
+  IF Kronos bearish + no exit signal yet     → tighten trailing stop by 50%
+  IF Kronos bullish                          → block momentum decay exit only
+  IF re-entry after trailing stop            → only re-enter if Kronos bullish
 """
 
 from __future__ import annotations
 
+import logging
 import numpy as np
+import pandas as pd
 from typing import Optional
 
 from strategy_helpers import roc_np, ema_np, atr_np
+
+logger = logging.getLogger("live_strategy")
 
 
 class LiveStrategy:
@@ -38,6 +47,12 @@ class LiveStrategy:
         mom_decay_period: int = 5,
         wait_buy: int = 9,
         wait_sell: int = 27,
+        # Kronos params
+        use_kronos: bool = True,
+        kronos_model: str = "NeoQuasar/Kronos-base",
+        kronos_horizon: int = 5,
+        kronos_bearish_threshold: float = 0.003,
+        kronos_interval: int = 1,
     ):
         self.broker = broker
         self.db_path = db_path
@@ -54,6 +69,13 @@ class LiveStrategy:
         self.mom_decay_period = mom_decay_period
         self.wait_buy = wait_buy
         self.wait_sell = wait_sell
+
+        # Kronos params
+        self.use_kronos = use_kronos
+        self.kronos_model = kronos_model
+        self.kronos_horizon = kronos_horizon
+        self.kronos_bearish_threshold = kronos_bearish_threshold
+        self.kronos_interval = kronos_interval
 
         # Rolling lists
         self._times: list[str]  = []
@@ -78,6 +100,34 @@ class LiveStrategy:
             self.roc_fast_period, self.roc_slow_period,
             self.trend_period, self.atr_period, self.mom_decay_period,
         )
+
+        # ── Kronos state ───────────────────────────────────────────────────────
+        self.kronos_overrides = 0   # times Kronos changed the signal
+        self.kronos_blocks    = 0   # times Kronos blocked an exit
+        self.kronos_confirms  = 0   # times Kronos confirmed/accelerated an exit
+        self._kronos_bar_counter = 0
+        self._kronos_signal: Optional[dict] = None
+
+        # Lazily initialise Kronos (import here to avoid circular deps)
+        self._kronos = None
+
+    # ── Kronos accessor (lazy init) ───────────────────────────────────────────
+
+    def _get_kronos(self):
+        if self._kronos is None and self.use_kronos:
+            try:
+                from engine.kronos_wrapper import get_kronos
+                self._kronos = get_kronos(
+                    model_name=self.kronos_model,
+                    horizon=self.kronos_horizon,
+                    bearish_threshold=self.kronos_bearish_threshold,
+                )
+                logger.info(f"[{self.tf_key}] Kronos wrapper loaded")
+            except Exception as e:
+                logger.warning(f"[{self.tf_key}] Kronos init failed: {e} — disabling")
+                self.use_kronos = False
+                self._kronos = None
+        return self._kronos
 
     # ── Append new candle ────────────────────────────────────────────────────
 
@@ -114,11 +164,62 @@ class LiveStrategy:
         self.atr       = atr_np(h, l, c, self.atr_period)
         self.mom_decay = roc_np(self.roc_fast, self.mom_decay_period)
 
-    # ── Core bar execution (mirrors _execute exactly) ────────────────────────
+    # ── Kronos signal ─────────────────────────────────────────────────────────
+
+    def _run_kronos(self) -> Optional[dict]:
+        """Run Kronos inference if counter % interval == 0."""
+        if not self.use_kronos:
+            return None
+
+        self._kronos_bar_counter += 1
+        if self._kronos_bar_counter % self.kronos_interval != 0:
+            # Return cached signal on non-poll bars
+            return self._kronos_signal
+
+        kronos = self._get_kronos()
+        if kronos is None or not kronos.is_loaded:
+            return None
+
+        try:
+            # Build DataFrame from rolling buffer
+            df = pd.DataFrame({
+                "open":   self._high[-512:] if len(self._high) >= 512 else self._high,
+                "high":   self._high[-512:] if len(self._high) >= 512 else self._high,
+                "low":    self._low[-512:]  if len(self._low)  >= 512 else self._low,
+                "close":  self._close[-512:] if len(self._close) >= 512 else self._close,
+                "volume": self._volume[-512:] if len(self._volume) >= 512 else self._volume,
+            })
+            df.columns = ["open", "high", "low", "close", "volume"]
+
+            sig = kronos.predict(df, horizon=self.kronos_horizon)
+            self._kronos_signal = sig
+            return sig
+        except Exception as e:
+            logger.debug(f"[{self.tf_key}] Kronos predict error: {e}")
+            return None
+
+    @property
+    def kronos_direction(self) -> str:
+        return self._kronos_signal.get("direction", "neutral") if self._kronos_signal else "neutral"
+
+    @property
+    def kronos_confidence(self) -> float:
+        return self._kronos_signal.get("confidence", 0.0) if self._kronos_signal else 0.0
+
+    @property
+    def kronos_predicted_close(self) -> float:
+        return self._kronos_signal.get("predicted_close", 0.0) if self._kronos_signal else 0.0
+
+    @property
+    def kronos_volatility_high(self) -> bool:
+        return self._kronos_signal.get("volatility_high", False) if self._kronos_signal else False
+
+    # ── Core bar execution (mirrors _execute + Kronos layer) ─────────────────
 
     def on_new_bar(self, timestamp: str) -> list[dict]:
         """
-        Entry/exit logic identical to _execute in strategy.py.
+        Entry/exit logic identical to _execute in strategy.py,
+        plus Kronos AI signal overrides.
         Full Kelly sizing: buy_all = cash/price, sell_all = close entire position.
         """
         events = []
@@ -142,6 +243,7 @@ class LiveStrategy:
             self._peak = price
 
         # ── Compute trailing stop level ─────────────────────────────────────
+        _kronos_tightened = False
         if self.broker.in_position:
             if c_atr > 0 and price > 0:
                 stop_distance_pct = (self.base_trailing_atr_mult * c_atr) / price
@@ -157,20 +259,54 @@ class LiveStrategy:
 
         bars_since = self.broker.bars_since_trade(bar_idx)
 
+        # ── Kronos ──────────────────────────────────────────────────────────
+        kronos_sig = self._run_kronos()
+        kronos_bearish = (kronos_sig and kronos_sig.get("direction") == "bearish")
+        kronos_bullish = (kronos_sig and kronos_sig.get("direction") == "bullish")
+
         # ── EXIT ─────────────────────────────────────────────────────────────
         if self.broker.in_position:
             exit_reason = None
+            kronos_action = "none"
 
             # Trailing stop hit
             if price < self._trail_level:
                 exit_reason = "trailing_stop"
 
-            # Momentum decay exit
+            # Momentum decay exit (KRONOS: block if bullish)
             elif c_roc_fast < c_roc_slow and c_mom_decay < 0:
-                exit_reason = "momentum_decay"
+                if kronos_bullish:
+                    # Kronos bullish → block momentum decay exit, let trailing stop work
+                    self.kronos_blocks += 1
+                    kronos_action = "block"
+                else:
+                    exit_reason = "momentum_decay"
+
+            # ── Kronos: bearish + existing exit signal → accelerate ──────────
+            if kronos_bearish and exit_reason:
+                exit_reason = "kronos_override"
+                self.kronos_overrides += 1
+                self.kronos_confirms += 1
+                kronos_action = "confirm"
+                logger.info(f"[{self.tf_key}] Kronos override: accelerate {exit_reason}")
+
+            # ── Kronos: bearish, no exit yet → tighten trailing stop 50% ───────
+            if kronos_bearish and not exit_reason:
+                # Tighten by 50%
+                tighten_pct = stop_distance_pct * 0.5
+                self._trail_level = self._peak * (1.0 - tighten_pct)
+                self.kronos_overrides += 1
+                self.kronos_blocks += 1
+                kronos_action = "tighten"
+                logger.info(f"[{self.tf_key}] Kronos: tightened trail 50%")
+
+                # Re-check tightened trail
+                if price < self._trail_level:
+                    exit_reason = "kronos_tighten"
+                    self.kronos_overrides += 1
+                    kronos_action = "confirm"
 
             if exit_reason:
-                # Full Kelly sell — close entire position
                 result = self.broker.sell(price, exit_reason=exit_reason)
                 if result["success"]:
                     self.broker.mark_trade_bar(bar_idx)
@@ -186,6 +322,7 @@ class LiveStrategy:
                         "exit_reason": exit_reason,
                         "cash_after": result["cash_after"],
                         "pv_after": pv,
+                        "kronos_action": kronos_action,
                     })
                     events.append({
                         "type": "equity",
@@ -200,47 +337,55 @@ class LiveStrategy:
         # ── ENTRY ──────────────────────────────────────────────────────────
         else:
             entered = False
+            kronos_action = "none"
 
             # Standard entry after wait_buy bars
             if bars_since > self.wait_buy:
                 if (c_roc_fast > 0 and c_roc_slow > 0 and price > c_trend):
-                    # Full Kelly buy
-                    result = self.broker.buy(price)
-                    if result["success"]:
-                        self.broker.mark_trade_bar(bar_idx)
-                        self._peak = price
-                        self._exit_reason_trailing = False
-                        entered = True
-                        events.append({
-                            "type": "trade",
-                            "timestamp": timestamp,
-                            "side": "BUY",
-                            "price": price,
-                            "qty": result["quantity"],
-                            "cash_after": result["cash_after"],
-                            "pv_after": pv,
-                        })
+                    # ── Kronos: re-entry only if bullish ───────────────────
+                    if self.use_kronos and not kronos_bullish:
+                        logger.debug(f"[{self.tf_key}] Kronos block: re-entry blocked (direction={self.kronos_direction})")
+                    else:
+                        result = self.broker.buy(price)
+                        if result["success"]:
+                            self.broker.mark_trade_bar(bar_idx)
+                            self._peak = price
+                            self._exit_reason_trailing = False
+                            entered = True
+                            events.append({
+                                "type": "trade",
+                                "timestamp": timestamp,
+                                "side": "BUY",
+                                "price": price,
+                                "qty": result["quantity"],
+                                "cash_after": result["cash_after"],
+                                "pv_after": pv,
+                            })
 
             # Quick re-entry after trailing stop exit (2-bar cooldown)
             elif (self._exit_reason_trailing
                     and bars_since > 2
                     and bars_since <= self.wait_buy):
                 if (c_roc_fast > 0 and c_roc_slow > 0 and price > c_trend):
-                    result = self.broker.buy(price)
-                    if result["success"]:
-                        self.broker.mark_trade_bar(bar_idx)
-                        self._peak = price
-                        self._exit_reason_trailing = False
-                        entered = True
-                        events.append({
-                            "type": "trade",
-                            "timestamp": timestamp,
-                            "side": "BUY",
-                            "price": price,
-                            "qty": result["quantity"],
-                            "cash_after": result["cash_after"],
-                            "pv_after": pv,
-                        })
+                    # ── Kronos: re-entry only if bullish ───────────────────
+                    if self.use_kronos and not kronos_bullish:
+                        logger.debug(f"[{self.tf_key}] Kronos block: quick re-entry blocked")
+                    else:
+                        result = self.broker.buy(price)
+                        if result["success"]:
+                            self.broker.mark_trade_bar(bar_idx)
+                            self._peak = price
+                            self._exit_reason_trailing = False
+                            entered = True
+                            events.append({
+                                "type": "trade",
+                                "timestamp": timestamp,
+                                "side": "BUY",
+                                "price": price,
+                                "qty": result["quantity"],
+                                "cash_after": result["cash_after"],
+                                "pv_after": pv,
+                            })
 
             if entered:
                 events.append({

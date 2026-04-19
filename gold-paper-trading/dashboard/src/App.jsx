@@ -6,6 +6,7 @@ import PortfolioPanel from "./components/PortfolioPanel.jsx";
 import IndicatorTable from "./components/IndicatorTable.jsx";
 import TradeLog from "./components/TradeLog.jsx";
 import ParamsPanel from "./components/ParamsPanel.jsx";
+import KronosPanel from "./components/KronosPanel.jsx";
 import { useWebSocket } from "./hooks/useWebSocket.js";
 
 const API = import.meta.env.VITE_API_URL || `http://${window.location.host}`;
@@ -20,6 +21,7 @@ function useTfData(timeframe) {
   const [equity, setEquity] = useState([]);
   const [candles, setCandles] = useState([]);
   const [params, setParams] = useState({});
+  const [kronosStats, setKronosStats] = useState({});
   const pollRef = useRef(null);
 
   const onTick = useCallback((data) => {
@@ -31,13 +33,14 @@ function useTfData(timeframe) {
   const fetchAll = useCallback(async () => {
     try {
       const tf = `?timeframe=${timeframe}`;
-      const [s, ind, t, eq, p, c] = await Promise.all([
+      const [s, ind, t, eq, p, c, ks] = await Promise.all([
         fetch(`${API}/status${tf}`).then((r) => r.json()),
         fetch(`${API}/indicators${tf}`).then((r) => r.json()),
         fetch(`${API}/trades${tf}&limit=50`).then((r) => r.json()),
         fetch(`${API}/equity${tf}&hours=168`).then((r) => r.json()),
         fetch(`${API}/params${tf}`).then((r) => r.json()),
         fetch(`${API}/candles/${timeframe}?limit=200`).then((r) => r.json()),
+        fetch(`${API}/api/kronos/stats${tf}`).then((r) => r.json()).catch(() => ({})),
       ]);
       setStatus(s);
       setIndicators(ind);
@@ -45,6 +48,7 @@ function useTfData(timeframe) {
       setEquity(eq);
       setParams(p);
       setCandles(Array.isArray(c) ? c : []);
+      setKronosStats(ks);
     } catch (e) {
       console.error(`[${timeframe}] fetch error:`, e);
     }
@@ -69,8 +73,8 @@ function useTfData(timeframe) {
     setEquity([]);
     setCandles([]);
     setParams({});
+    setKronosStats({});
     fetchAll();
-    // Candles separately (different endpoint shape)
     fetch(`${API}/candles/${timeframe}?limit=200`)
       .then((r) => r.json())
       .then((c) => setCandles(Array.isArray(c) ? c : []))
@@ -85,12 +89,28 @@ function useTfData(timeframe) {
   const lastBarTime = tick?.last_bar_time || status?.last_bar_time || "";
   const winRate = tick?.win_rate ?? status?.win_rate ?? 0;
   const tradeCount = tick?.trade_count ?? status?.trade_count ?? 0;
+  const kronosData = tick?.kronos || null;
+  const kronosOnline = !!(kronosData && kronosData.direction);
+  const kronosEnabled = tick?.use_kronos ?? params?.use_kronos ?? true;
 
   return {
     tick, status, indicators, trades, equity, candles, params,
     price, inPos, pv, entry, trail, lastBarTime,
     connected, winRate, tradeCount, fetchAll,
+    kronosData, kronosOnline, kronosEnabled, kronosStats,
   };
+}
+
+async function toggleKronos(enabled) {
+  try {
+    await fetch(`${API}/api/kronos/toggle`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+  } catch (e) {
+    console.error("Kronos toggle failed:", e);
+  }
 }
 
 function TfTab({ timeframe, active }) {
@@ -110,6 +130,9 @@ function TfTab({ timeframe, active }) {
         pv={d.pv}
         tradeCount={d.tradeCount}
         winRate={d.winRate}
+        kronosOnline={d.kronosOnline}
+        kronosEnabled={d.kronosEnabled}
+        onKronosToggle={(enabled) => toggleKronos(enabled)}
       />
 
       <div className="flex-1 grid grid-cols-1 xl:grid-cols-3 gap-2 min-h-0">
@@ -128,6 +151,7 @@ function TfTab({ timeframe, active }) {
 
         {/* Col 2: Status panels */}
         <div className="flex flex-col gap-2 min-h-0">
+          <KronosPanel kronosData={d.kronosData} stats={d.kronosStats} />
           <PositionStatus
             tick={d.tick}
             status={d.status}

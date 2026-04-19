@@ -90,6 +90,21 @@ def init_db(db_path: str):
         )
     """)
 
+    # ── Kronos AI signals table ────────────────────────────────────────────────
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS kronos_signals (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp    TEXT NOT NULL,
+            timeframe    TEXT NOT NULL,
+            direction    TEXT,
+            confidence   REAL,
+            pred_close   REAL,
+            vol_high     INTEGER,
+            action_taken TEXT,
+            created_at   TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -254,3 +269,78 @@ def get_latest_candle_time(db_path: str) -> Optional[str]:
     ).fetchone()
     conn.close()
     return row["timestamp"] if row else None
+
+
+# ── Kronos signal helpers ─────────────────────────────────────────────────────
+
+def save_kronos_signal(db_path: str, timestamp: str, timeframe: str,
+                       direction: str, confidence: float,
+                       pred_close: float, vol_high: bool,
+                       action_taken: str) -> None:
+    """Append a Kronos signal record to the kronos_signals table."""
+    conn = getconn(db_path)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO kronos_signals
+            (timestamp, timeframe, direction, confidence, pred_close, vol_high, action_taken)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (timestamp, timeframe, direction, confidence, pred_close,
+          1 if vol_high else 0, action_taken))
+    conn.commit()
+    conn.close()
+
+
+def get_kronos_signals(db_path: str, limit: int = 100) -> list:
+    """Return the most recent Kronos signal records."""
+    conn = getconn(db_path)
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT * FROM kronos_signals ORDER BY id DESC LIMIT ?",
+        (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_kronos_stats(db_path: str) -> dict:
+    """
+    Aggregate Kronos signal stats from DB.
+    Returns override / block / confirm counts and per-direction accuracy
+    (if exit_reason was recorded after the signal).
+    """
+    conn = getconn(db_path)
+    c = conn.cursor()
+
+    total = c.execute("SELECT COUNT(*) FROM kronos_signals").fetchone()[0]
+
+    overrides = c.execute(
+        "SELECT COUNT(*) FROM kronos_signals WHERE action_taken IN ('confirm','tighten')"
+    ).fetchone()[0]
+    blocks = c.execute(
+        "SELECT COUNT(*) FROM kronos_signals WHERE action_taken = 'block'"
+    ).fetchone()[0]
+    confirms = c.execute(
+        "SELECT COUNT(*) FROM kronos_signals WHERE action_taken = 'confirm'"
+    ).fetchone()[0]
+
+    bullish = c.execute(
+        "SELECT COUNT(*) FROM kronos_signals WHERE direction = 'bullish'"
+    ).fetchone()[0]
+    bearish = c.execute(
+        "SELECT COUNT(*) FROM kronos_signals WHERE direction = 'bearish'"
+    ).fetchone()[0]
+    neutral = c.execute(
+        "SELECT COUNT(*) FROM kronos_signals WHERE direction = 'neutral'"
+    ).fetchone()[0]
+
+    conn.close()
+
+    return {
+        "total_signals":   total,
+        "overrides":       overrides,
+        "blocks":          blocks,
+        "confirms":        confirms,
+        "bullish_count":   bullish,
+        "bearish_count":   bearish,
+        "neutral_count":   neutral,
+    }

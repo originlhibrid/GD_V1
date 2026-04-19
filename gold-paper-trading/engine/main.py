@@ -27,12 +27,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from engine.config import (
-    STARTING_CAPITAL, COMMISSION, TIMEFRAMES,
+    STARTING_CAPITAL, TIMEFRAMES,
     ROC_FAST_PERIOD, ROC_SLOW_PERIOD, TREND_PERIOD, ATR_PERIOD,
     BASE_TRAILING_ATR_MULT, TRAIL_TIGHTEN_MULT, MOM_STRONG_THRESHOLD,
     MOM_DECAY_PERIOD, WAIT_BUY,
+    USE_KRONOS, KRONOS_MODEL, KRONOS_HORIZON,
+    KRONOS_BEARISH_THRESHOLD, KRONOS_INTERVAL,
 )
-from engine.db import init_db, save_params, write_candle, write_trade, write_equity_snapshot, write_indicators
+from engine.db import init_db, save_params, write_candle, write_trade, write_equity_snapshot, write_indicators, save_kronos_signal
 from engine.data_feed import fetch_yfinance, fetch_latest, iter_new_candles
 from engine.broker import PaperBroker
 from engine.live_strategy import LiveStrategy
@@ -85,7 +87,7 @@ def run_instance(tf: str):
     })
 
     # ── Build broker and strategy ─────────────────────────────────────────────
-    broker = PaperBroker(starting_cash=STARTING_CAPITAL, commission_rate=COMMISSION)
+    broker = PaperBroker(starting_cash=STARTING_CAPITAL)
 
     strategy = LiveStrategy(
         broker=broker,
@@ -100,6 +102,11 @@ def run_instance(tf: str):
         mom_strong_threshold=MOM_STRONG_THRESHOLD,
         mom_decay_period=MOM_DECAY_PERIOD,
         wait_buy=WAIT_BUY,
+        use_kronos=USE_KRONOS,
+        kronos_model=KRONOS_MODEL,
+        kronos_horizon=KRONOS_HORIZON,
+        kronos_bearish_threshold=KRONOS_BEARISH_THRESHOLD,
+        kronos_interval=KRONOS_INTERVAL,
     )
 
     # ── Historical warmup ─────────────────────────────────────────────────────
@@ -179,6 +186,8 @@ def run_instance(tf: str):
                         )
                 # Persist indicators
                 _write_indicators_from_strategy(db_path, ts, strategy, broker, c)
+                # Persist Kronos signal
+                _write_kronos_signal(db_path, ts, tf, strategy)
 
             last_ts = df_new.index[-1].to_pydatetime()
 
@@ -203,6 +212,27 @@ def run_instance(tf: str):
                 broker.in_position,
             )
         except (IndexError, ValueError):
+            pass
+
+    def _write_kronos_signal(db_path, ts, tf, strat):
+        """Persist the latest Kronos signal to DB."""
+        sig = strat._kronos_signal
+        if sig is None:
+            return
+        action = "none"
+        # Determine action from kronos counters delta (approximate)
+        # The strategy sets these counters — we capture the current state
+        try:
+            direction = sig.get("direction", "neutral")
+            confidence = sig.get("confidence", 0.0)
+            pred_close = sig.get("predicted_close", 0.0)
+            vol_high = sig.get("volatility_high", False)
+            save_kronos_signal(
+                db_path, ts, tf,
+                direction, confidence, pred_close, vol_high,
+                action,
+            )
+        except Exception:
             pass
 
     scheduler.add_job(

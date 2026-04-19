@@ -1,6 +1,11 @@
 __pycache__/
 *.pyc
 *.db
+*.sqlite
 node_modules/
 .env
 *.log
+dashboard/dist/
+models/
+logs/
+data/
